@@ -361,6 +361,16 @@ def get_expiry_from_dom(sb) -> str:
     return None
 
 
+# Deutsche + englische Cooldown-Regex
+COOLDOWN_RE = re.compile(
+    r"(?:Renew in|Renewal cooldown|Verl[äa]ngern in|"
+    r"Verl[äa]ngerung in|N[äa]chste Verl[äa]ngerung in|"
+    r"Verl[äa]ngerung m[öo]glich in)"
+    r"\s+(\d{1,2}:\d{2}:\d{2})",
+    re.I,
+)
+
+
 # ── Hauptablauf ──────────────────────────────────────────────────────
 def main():
     print("#" * 25)
@@ -371,7 +381,7 @@ def main():
     PROXY_SERVER = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1080"
     HEADLESS = (os.environ.get("HEADLESS", "false").lower() == "true")
 
-    sb_kwargs = {"uc": True, "headless": HEADLESS, "locale_code": "en-US"}
+    sb_kwargs = {"uc": True, "headless": HEADLESS, "locale_code": "de-DE"}
     if IS_PROXY:
         print(f"Proxy aktiv: {PROXY_SERVER}")
         sb_kwargs["proxy"] = PROXY_SERVER
@@ -451,30 +461,59 @@ def main():
         else:
             print("Ablaufdatum nicht gefunden")
 
-        # Renew-Button suchen
+        # nach unten scrollen, damit Vue den Button rendert
+        try:
+            sb.scroll_to_bottom()
+            sb.sleep(2)
+            print("Nach unten gescrollt")
+        except Exception as e:
+            print(f"Scroll fehlgeschlagen: {e}")
+
+        # Renew-Button suchen (DE + EN)
         outer_renew_selector = None
         countdown_text = None
-        candidates = [
-            'type:button("Renew free plan")',
+
+        possible_selectors = [
+            'button[title*="Free-Tarif um 4 Tage"]',
+            'button[title*="verlängern"]',
+            'button[title*="4 Tage"]',
+            '//button[contains(@class, "btn-primary")][contains(., "Free-Tarif")]',
+            '//button[contains(@class, "btn-primary")][contains(., "Für 4 Tage")]',
+            'button:contains("Für 4 Tage verlängern")',
+            'button:contains("Free-Tarif verlängern")',
             'button:contains("Renew free plan")',
-            '[class*="btn btn-primary btn-sm"]',
+            '//button[contains(@class, "btn-primary")]',
         ]
-        for sel in candidates:
+
+        for sel in possible_selectors:
             try:
                 if sb.is_element_visible(sel):
-                    text = sb.get_text(sel)
-                    m = re.search(
-                        r"(?:Renew in|Renewal cooldown)\s+(\d{1,2}:\d{2}:\d{2})",
-                        text, re.I,
-                    )
+                    text = (sb.get_text(sel) or "").strip()
+                    print(f"  Selektor '{sel}' → Text: {text!r}")
+
+                    m = COOLDOWN_RE.search(text)
                     if m:
                         countdown_text = m.group(1)
                         print(f"Cooldown aktiv: '{text}'")
                         break
-                    elif "Renew" in text:
+
+                    if any(w in text for w in
+                           ("Renew", "Verlängern", "Free-Tarif",
+                            "Für 4 Tage", "verlängern")):
                         outer_renew_selector = sel
                         print(f"Renew-Button verfügbar: '{text}'")
                         break
+            except Exception as e:
+                print(f"  Selektor '{sel}' Fehler: {e}")
+
+        # auch Gesamttext prüfen ob Cooldown
+        if not outer_renew_selector and not countdown_text:
+            try:
+                full_text = sb.get_page_text()
+                m = COOLDOWN_RE.search(full_text)
+                if m:
+                    countdown_text = m.group(1)
+                    print(f"Cooldown im Seitentext: {countdown_text}")
             except Exception:
                 pass
 
@@ -488,11 +527,12 @@ def main():
         if not outer_renew_selector:
             print("Kein Renew-Button gefunden")
             notify("⚠️ Kein Renew-Button",
-                   error="Button weder aktiv noch im Cooldown sichtbar")
+                   error="Button weder aktiv noch im Cooldown sichtbar",
+                   expiry=current_expiry or "")
             return
 
         # Button klicken
-        print("Klicke Renew-Button, warte auf Modal...")
+        print(f"Klicke Renew-Button: {outer_renew_selector}")
         try:
             sb.sleep(2)
             sb.click(outer_renew_selector)
@@ -527,48 +567,7 @@ def main():
         print("Warte auf Confirm-Button und klicke...")
         time.sleep(5)
         clicked = False
-        try:
-            sb.click('div[role="dialog"] button.btn-primary', timeout=8)
-            clicked = True
-            print("Confirm geklickt")
-        except Exception as e:
-            print(f"Confirm-Klick fehlgeschlagen: {e}")
-
-        sb.sleep(5)
-        sb.refresh()
-        print("Warte auf neue Ablaufdaten...")
-        sb.wait_for_ready_state_complete()
-        sb.sleep(3)
-
-        # Neue Werte lesen
-        try:
-            new_text = sb.get_page_text() + "\n" + sb.get_page_source()
-        except Exception:
-            new_text = sb.get_page_source()
-        new_expiry = get_expiry_from_dom(sb) or extract_expiry_date(new_text)
-        new_match = re.search(
-            r"(?:Renewal cooldown|Renew in)\s+(\d{1,2}:\d{2}:\d{2})", new_text,
-        )
-
-        if new_match:
-            new_countdown = new_match.group(1)
-            print(f"Renew erfolgreich, neuer Countdown: {new_countdown}")
-            if new_expiry:
-                print(f"Neuer Ablauf: {new_expiry}")
-            notify("✅ Renew erfolgreich",
-                   extra=f"Nächster Renew in {format_countdown(new_countdown)}",
-                   expiry=new_expiry or "unbekannt")
-        elif new_expiry and new_expiry != current_expiry:
-            print(f"Renew erfolgreich, neuer Ablauf: {new_expiry}")
-            notify("✅ Renew erfolgreich",
-                   extra="Ablaufdatum aktualisiert",
-                   expiry=new_expiry)
-        else:
-            print("Ergebnis unklar — Ablaufdatum unverändert")
-            notify("⚠️ Renew unklar",
-                   error="Ablaufdatum unverändert",
-                   extra=f"Confirm geklickt: {clicked}")
-
-
-if __name__ == "__main__":
-    main()
+        confirm_candidates = [
+            'div[role="dialog"] button.btn-primary',
+            'button.btn.btn-primary[style*="width: 100%"]',
+            '//button[contains(@class, "btn-primary")][c
